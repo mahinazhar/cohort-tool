@@ -1,11 +1,14 @@
 """Core cleaning / cohort / charting logic shared by the Streamlit app.
 
 Pipeline: load CSV -> clean (drop missing CustomerID, exact duplicates,
-negative quantity, non-positive unit price) -> assign each customer a
-cohort (first purchase month) -> compute each transaction's period index
-(months since the customer's cohort month) -> aggregate into cohort
-matrices (customer count, revenue, retention %, cumulative revenue per
-customer) -> render heatmaps/line charts.
+unparseable dates, non-positive unit price; net cancellations against the
+purchases they reverse) -> assign each customer a cohort (first purchase
+month) -> compute each transaction's period index (months since the
+customer's cohort month) -> aggregate into cohort matrices (customer
+count, revenue, retention %, cumulative revenue per customer) -> render
+heatmaps/line charts. A trailing partial calendar month (if the data
+doesn't reach that month's last day) is excluded from the cohort analysis
+so it doesn't understate retention/revenue for every cohort still active.
 """
 
 import io
@@ -19,6 +22,8 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 
 REQUIRED_COLUMNS = ["CustomerID", "InvoiceDate", "Quantity", "UnitPrice"]
+
+CURRENCY_SYMBOL = "£"  # GBP
 
 CANDIDATE_DATE_FORMATS = [
     "%m/%d/%y %H:%M",
@@ -101,11 +106,90 @@ def parse_dates(series: pd.Series) -> pd.Series:
     return best
 
 
+def net_out_cancellations(df: pd.DataFrame):
+    """Nets cancellations (negative-Quantity rows) against the customer's
+    prior purchases of the same product, so a cancelled sale contributes
+    zero net revenue instead of the return being dropped while the
+    original sale it reversed still counts in full.
+
+    Requires a `StockCode` column to match a cancellation to the product
+    it reversed; without one, cancellations are just dropped (old
+    behaviour) and this is reported via `cancellation_netting_applied`.
+
+    Matches most-recent-purchase-first (LIFO) within each
+    (CustomerID, StockCode) group, consuming whole or partial quantities
+    from prior positive-quantity rows until the cancelled quantity is
+    covered. Any leftover (no matching purchase found at all) is reported
+    as `cancellation_unmatched_quantity`.
+    """
+    stats = {
+        "cancellation_rows_removed": int((df["Quantity"] < 0).sum()),
+        "cancellation_netting_applied": "StockCode" in df.columns,
+        "cancellation_netting_rows_removed": 0,
+        "cancellation_netting_revenue_removed": 0.0,
+        "cancellation_unmatched_quantity": 0.0,
+    }
+
+    if "StockCode" not in df.columns:
+        stats["cancellation_unmatched_quantity"] = float(-df.loc[df["Quantity"] < 0, "Quantity"].sum())
+        return df, stats
+
+    df = df.reset_index(drop=True)
+    qty = df["Quantity"].to_numpy(dtype=float)
+    new_qty = qty.copy()
+    ts = df["InvoiceTimestamp"].to_numpy()
+    unit_price = df["UnitPrice"].to_numpy(dtype=float)
+
+    groups = df.groupby(["CustomerID", "StockCode"], sort=False).indices
+    unmatched_qty = 0.0
+
+    for _, idx in groups.items():
+        g_qty = qty[idx]
+        neg_local = np.where(g_qty < 0)[0]
+        if neg_local.size == 0:
+            continue
+        new_qty[idx[neg_local]] = 0.0
+        g_ts = ts[idx]
+        pos_local = np.where(g_qty > 0)[0]
+        neg_order = neg_local[np.argsort(-g_ts[neg_local].astype("int64"))]
+        if pos_local.size == 0:
+            unmatched_qty += float(-g_qty[neg_local].sum())
+            continue
+        pos_order = pos_local[np.argsort(-g_ts[pos_local].astype("int64"))]
+        remaining = g_qty[pos_order].copy()
+        pos_ptr = 0
+        n_pos = len(pos_order)
+        for li in neg_order:
+            needed = -g_qty[li]
+            while needed > 0 and pos_ptr < n_pos:
+                avail = remaining[pos_ptr]
+                consume = min(avail, needed)
+                remaining[pos_ptr] -= consume
+                needed -= consume
+                if remaining[pos_ptr] == 0:
+                    pos_ptr += 1
+            if needed > 0:
+                unmatched_qty += needed
+        new_qty[idx[pos_order]] = remaining
+
+    removed_revenue = float(((qty - new_qty) * unit_price)[qty > 0].sum())
+    fully_dropped_positive_rows = int(((qty > 0) & (new_qty == 0)).sum())
+
+    df = df.copy()
+    df["Quantity"] = new_qty
+    df["Revenue"] = df["Quantity"] * df["UnitPrice"]
+
+    stats["cancellation_netting_rows_removed"] = fully_dropped_positive_rows
+    stats["cancellation_netting_revenue_removed"] = removed_revenue
+    stats["cancellation_unmatched_quantity"] = float(unmatched_qty)
+    return df, stats
+
+
 def clean_and_assign_cohorts(df_raw: pd.DataFrame):
     """Returns (transactions_df, summary_dict).
 
-    transactions_df has every original column plus Revenue, InvoiceMonth,
-    CohortMonth ('YYYY-MM') and PeriodIndex, for rows that survived cleaning.
+    transactions_df has every original column plus Revenue, CohortMonth
+    ('YYYY-MM') and PeriodIndex, for rows that survived cleaning.
     """
     original_columns = list(df_raw.columns)
 
@@ -148,22 +232,23 @@ def clean_and_assign_cohorts(df_raw: pd.DataFrame):
     step2_count = con.execute("SELECT COUNT(*) FROM step2_deduped").fetchone()[0]
     duplicate_count = step1_count - step2_count
 
-    negative_qty_count = con.execute(
-        "SELECT COUNT(*) FROM step2_deduped WHERE Quantity < 0"
-    ).fetchone()[0]
+    deduped_df = con.execute("SELECT * FROM step2_deduped").fetchdf()
+    netted_df, netting_stats = net_out_cancellations(deduped_df)
+    con.register("step3_netted", netted_df)
+
     con.execute("""
-        CREATE OR REPLACE TABLE step3_positive_qty AS
-        SELECT * FROM step2_deduped WHERE Quantity >= 0
+        CREATE OR REPLACE TABLE step4_positive_qty AS
+        SELECT * FROM step3_netted WHERE Quantity > 0
     """)
 
     non_positive_price_count = con.execute(
-        "SELECT COUNT(*) FROM step3_positive_qty WHERE UnitPrice <= 0"
+        "SELECT COUNT(*) FROM step4_positive_qty WHERE UnitPrice <= 0"
     ).fetchone()[0]
 
     con.execute("""
         CREATE OR REPLACE TABLE clean_retail AS
         SELECT *, date_trunc('month', InvoiceTimestamp) AS InvoiceMonth
-        FROM step3_positive_qty
+        FROM step4_positive_qty
         WHERE UnitPrice > 0
     """)
 
@@ -186,6 +271,9 @@ def clean_and_assign_cohorts(df_raw: pd.DataFrame):
         ORDER BY cc.CohortMonth, r.CustomerID, r.InvoiceTimestamp
     """).fetchdf()
 
+    max_invoice_row = con.execute("SELECT MAX(InvoiceTimestamp) FROM clean_retail").fetchone()[0]
+    last_full_month, last_month_is_partial = _last_full_month(max_invoice_row)
+
     final_row_count = len(transactions_df)
     final_customer_count = transactions_df["CustomerID"].nunique()
 
@@ -195,24 +283,47 @@ def clean_and_assign_cohorts(df_raw: pd.DataFrame):
         "missing_customer_count": int(missing_customer_count),
         "missing_customer_revenue": float(missing_customer_revenue),
         "duplicate_count": int(duplicate_count),
-        "negative_qty_count": int(negative_qty_count),
         "non_positive_price_count": int(non_positive_price_count),
         "final_row_count": int(final_row_count),
         "final_customer_count": int(final_customer_count),
+        "last_full_month": last_full_month,
+        "last_month_is_partial": last_month_is_partial,
+        **netting_stats,
     }
 
     con.close()
     return transactions_df, summary
 
 
+def _last_full_month(max_invoice_timestamp):
+    """Returns (last_full_month 'YYYY-MM', is_partial) for the given max
+    timestamp in the cleaned data. If the data's last calendar month
+    doesn't reach that month's final day, it's treated as partial and the
+    prior month is returned instead."""
+    if max_invoice_timestamp is None:
+        return None, False
+    max_ts = pd.Timestamp(max_invoice_timestamp)
+    last_day_of_month = (max_ts + pd.offsets.MonthEnd(0)).day
+    is_partial = max_ts.day < last_day_of_month
+    if is_partial:
+        last_full = (max_ts.replace(day=1) - pd.Timedelta(days=1))
+    else:
+        last_full = max_ts
+    return last_full.strftime("%Y-%m"), is_partial
+
+
 # --------------------------------------------------------------------------
 # Cohort matrices
 # --------------------------------------------------------------------------
 
-def build_matrices(transactions_df: pd.DataFrame):
+def build_matrices(transactions_df: pd.DataFrame, last_full_month: str):
     """Builds the 4 cohort matrices. Cells beyond a cohort's observed
-    horizon (it hasn't existed that many months yet) are NaN; cells within
-    the horizon with no activity are 0."""
+    horizon (it hasn't existed that many months yet, or the period falls
+    after `last_full_month`) are NaN; cells within the horizon with no
+    activity are 0. A cohort whose first purchase falls entirely after
+    `last_full_month` (e.g. a partial trailing month) gets an all-NaN row
+    across every matrix, so it reads as excluded/greyed-out rather than
+    "no activity"."""
     con = duckdb.connect()
     con.register("tx", transactions_df)
 
@@ -225,11 +336,9 @@ def build_matrices(transactions_df: pd.DataFrame):
         ORDER BY CohortMonth, PeriodIndex
     """).fetchdf()
 
-    horizon = con.execute("""
+    horizon = con.execute(f"""
         SELECT CohortMonth, date_diff(
-            'month',
-            strptime(CohortMonth, '%Y-%m'),
-            (SELECT MAX(strptime(CohortMonth, '%Y-%m') + INTERVAL (PeriodIndex) MONTH) FROM tx)
+            'month', strptime(CohortMonth, '%Y-%m'), strptime('{last_full_month}', '%Y-%m')
         ) AS MaxValidPeriod
         FROM (SELECT DISTINCT CohortMonth FROM tx)
     """).fetchdf().set_index("CohortMonth")["MaxValidPeriod"]
@@ -271,20 +380,19 @@ def build_matrices(transactions_df: pd.DataFrame):
     }
 
 
-def suggested_cac(transactions_df: pd.DataFrame) -> float:
-    orders = transactions_df.groupby("InvoiceNo")["Revenue"].sum() if "InvoiceNo" in transactions_df.columns else None
-    avg_order_value = float(orders.mean()) if orders is not None and len(orders) else float(transactions_df["Revenue"].mean())
-    avg_revenue_per_customer = float(
-        transactions_df["Revenue"].sum() / transactions_df["CustomerID"].nunique()
-    )
-    # a round number between one average order and a ~4:1 LTV:CAC ratio
-    candidate = max(avg_order_value, avg_revenue_per_customer / 4)
-    return round(candidate / 10) * 10
+def apply_gross_margin(cumulative_revenue_per_customer: pd.DataFrame, margin_pct: float) -> pd.DataFrame:
+    """Converts cumulative revenue per customer into cumulative gross
+    profit per customer at the given margin assumption (0-100)."""
+    return (cumulative_revenue_per_customer * (margin_pct / 100)).round(2)
 
 
-def payback_periods(cumulative_revenue_per_customer: pd.DataFrame, cac: float):
+def payback_periods(cumulative_value_per_customer: pd.DataFrame, cac: float):
+    """For each cohort, the first period where the cumulative value
+    (e.g. gross profit) per customer reaches the given CAC. None if it
+    never does within the observed/included window; a cohort that's
+    entirely excluded (all-NaN row) also returns None."""
     results = {}
-    for cohort, row in cumulative_revenue_per_customer.iterrows():
+    for cohort, row in cumulative_value_per_customer.iterrows():
         reached = row[row >= cac]
         results[cohort] = int(reached.index[0]) if not reached.empty else None
     return results
@@ -328,7 +436,11 @@ def render_heatmap(matrix: pd.DataFrame, title: str, value_fmt, cbar_label: str)
     ax.set_xticks(range(n_cols))
     ax.set_xticklabels(matrix.columns, color=INK_MUTED, fontsize=8)
     ax.set_yticks(range(n_rows))
-    ax.set_yticklabels(matrix.index, color=INK_MUTED, fontsize=8)
+    ytick_labels = [
+        f"{cohort} (excluded)" if matrix.loc[cohort].isna().all() else str(cohort)
+        for cohort in matrix.index
+    ]
+    ax.set_yticklabels(ytick_labels, color=INK_MUTED, fontsize=8)
     ax.set_xlabel("Period (months since first purchase)", color=INK_SECONDARY, fontsize=10)
     ax.set_ylabel("Cohort", color=INK_SECONDARY, fontsize=10)
     ax.set_title(title, color=INK_PRIMARY, fontsize=13, pad=12)
@@ -340,7 +452,8 @@ def render_heatmap(matrix: pd.DataFrame, title: str, value_fmt, cbar_label: str)
     cbar.ax.tick_params(colors=INK_MUTED, labelsize=8)
     cbar.outline.set_visible(False)
 
-    fig.text(0.01, 0.01, "Blank cells: cohort hasn't reached that period yet.",
+    fig.text(0.01, 0.01,
+              "Blank cells: cohort hasn't reached that period yet, or it's an excluded partial month.",
               color=INK_MUTED, fontsize=8, style="italic")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     return fig
@@ -353,7 +466,10 @@ def render_retention_chart(customer_retention: pd.DataFrame):
     fig, ax = plt.subplots(figsize=(10, 6.5), dpi=150)
     style_axes(ax)
     for cohort, color in zip(cohorts, colors):
-        ax.plot(customer_retention.columns, customer_retention.loc[cohort],
+        row = customer_retention.loc[cohort]
+        if row.isna().all():
+            continue
+        ax.plot(customer_retention.columns, row,
                 color=color, linewidth=1.8, solid_capstyle="round", label=cohort)
 
     ax.set_title("Customer retention by cohort", color=INK_PRIMARY, fontsize=13, pad=12)
@@ -365,36 +481,41 @@ def render_retention_chart(customer_retention: pd.DataFrame):
                         fontsize=8, title_fontsize=9, frameon=False)
     plt.setp(legend.get_texts(), color=INK_SECONDARY)
     legend.get_title().set_color(INK_PRIMARY)
-    fig.text(0.01, 0.01, "Each line stops at that cohort's last observed period.",
+    fig.text(0.01, 0.01,
+              "Each line stops at that cohort's last included period; excluded (partial-month) cohorts aren't plotted.",
               color=INK_MUTED, fontsize=8, style="italic")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     return fig
 
 
-def render_cac_chart(cumulative_revenue_per_customer: pd.DataFrame, cac: float):
-    cohorts = list(cumulative_revenue_per_customer.index)
+def render_cac_chart(cumulative_profit_per_customer: pd.DataFrame, cac: float):
+    cohorts = list(cumulative_profit_per_customer.index)
     colors = cohort_line_colors(len(cohorts))
 
     fig, ax = plt.subplots(figsize=(10, 6.5), dpi=150)
     style_axes(ax)
     for cohort, color in zip(cohorts, colors):
-        ax.plot(cumulative_revenue_per_customer.columns, cumulative_revenue_per_customer.loc[cohort],
+        row = cumulative_profit_per_customer.loc[cohort]
+        if row.isna().all():
+            continue
+        ax.plot(cumulative_profit_per_customer.columns, row,
                 color=color, linewidth=1.8, solid_capstyle="round", label=cohort)
 
     ax.axhline(cac, color=STATUS_CRITICAL, linewidth=1.5, linestyle="--", zorder=3)
-    ax.text(ax.get_xlim()[1], cac, f"  CAC = ${cac:,.0f}", color=STATUS_CRITICAL,
+    ax.text(ax.get_xlim()[1], cac, f"  CAC = {CURRENCY_SYMBOL}{cac:,.0f}", color=STATUS_CRITICAL,
             fontsize=9, va="center", ha="left", fontweight="bold")
 
-    ax.set_title("Cumulative revenue per customer vs. CAC", color=INK_PRIMARY, fontsize=13, pad=12)
+    ax.set_title("Cumulative gross profit per customer vs. CAC", color=INK_PRIMARY, fontsize=13, pad=12)
     ax.set_xlabel("Period (months since first purchase)", color=INK_SECONDARY, fontsize=10)
-    ax.set_ylabel("Cumulative revenue per customer ($)", color=INK_SECONDARY, fontsize=10)
-    ax.set_xticks(cumulative_revenue_per_customer.columns)
+    ax.set_ylabel(f"Cumulative gross profit per customer ({CURRENCY_SYMBOL})", color=INK_SECONDARY, fontsize=10)
+    ax.set_xticks(cumulative_profit_per_customer.columns)
     ax.set_ylim(0, None)
     legend = ax.legend(title="Cohort", loc="upper left", bbox_to_anchor=(1.02, 1.0),
                         fontsize=8, title_fontsize=9, frameon=False)
     plt.setp(legend.get_texts(), color=INK_SECONDARY)
     legend.get_title().set_color(INK_PRIMARY)
-    fig.text(0.01, 0.01, "Each line stops at that cohort's last observed period.",
+    fig.text(0.01, 0.01,
+              "Each line stops at that cohort's last included period; excluded (partial-month) cohorts aren't plotted.",
               color=INK_MUTED, fontsize=8, style="italic")
     fig.tight_layout(rect=(0, 0.03, 1, 1))
     return fig
