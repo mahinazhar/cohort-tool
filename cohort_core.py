@@ -116,11 +116,13 @@ def net_out_cancellations(df: pd.DataFrame):
     it reversed; without one, cancellations are just dropped (old
     behaviour) and this is reported via `cancellation_netting_applied`.
 
-    Matches most-recent-purchase-first (LIFO) within each
-    (CustomerID, StockCode) group, consuming whole or partial quantities
-    from prior positive-quantity rows until the cancelled quantity is
-    covered. Any leftover (no matching purchase found at all) is reported
-    as `cancellation_unmatched_quantity`.
+    Processes each (CustomerID, StockCode) group in chronological order
+    and matches each cancellation to its most recent *prior* purchase
+    first (LIFO), falling back to older purchases, consuming whole or
+    partial quantities until the cancelled quantity is covered. A
+    purchase dated after the cancellation is never used as a match. Any
+    leftover (no prior purchase found at all) is reported as
+    `cancellation_unmatched_quantity`.
     """
     stats = {
         "cancellation_rows_removed": int((df["Quantity"] < 0).sum()),
@@ -145,32 +147,30 @@ def net_out_cancellations(df: pd.DataFrame):
 
     for _, idx in groups.items():
         g_qty = qty[idx]
-        neg_local = np.where(g_qty < 0)[0]
-        if neg_local.size == 0:
+        if not (g_qty < 0).any():
             continue
-        new_qty[idx[neg_local]] = 0.0
         g_ts = ts[idx]
-        pos_local = np.where(g_qty > 0)[0]
-        neg_order = neg_local[np.argsort(-g_ts[neg_local].astype("int64"))]
-        if pos_local.size == 0:
-            unmatched_qty += float(-g_qty[neg_local].sum())
-            continue
-        pos_order = pos_local[np.argsort(-g_ts[pos_local].astype("int64"))]
-        remaining = g_qty[pos_order].copy()
-        pos_ptr = 0
-        n_pos = len(pos_order)
-        for li in neg_order:
-            needed = -g_qty[li]
-            while needed > 0 and pos_ptr < n_pos:
-                avail = remaining[pos_ptr]
-                consume = min(avail, needed)
-                remaining[pos_ptr] -= consume
-                needed -= consume
-                if remaining[pos_ptr] == 0:
-                    pos_ptr += 1
-            if needed > 0:
-                unmatched_qty += needed
-        new_qty[idx[pos_order]] = remaining
+        time_order = np.argsort(g_ts.astype("int64"), kind="stable")
+        remaining = g_qty.copy()
+
+        stack = []  # local positions with remaining qty > 0, oldest-pushed-first
+        for li in time_order:
+            if g_qty[li] > 0:
+                stack.append(li)
+            elif g_qty[li] < 0:
+                needed = -g_qty[li]
+                while needed > 0 and stack:
+                    top = stack[-1]
+                    consume = min(remaining[top], needed)
+                    remaining[top] -= consume
+                    needed -= consume
+                    if remaining[top] == 0:
+                        stack.pop()
+                if needed > 0:
+                    unmatched_qty += needed
+                remaining[li] = 0.0
+
+        new_qty[idx] = remaining
 
     removed_revenue = float(((qty - new_qty) * unit_price)[qty > 0].sum())
     fully_dropped_positive_rows = int(((qty > 0) & (new_qty == 0)).sum())
@@ -344,7 +344,9 @@ def build_matrices(transactions_df: pd.DataFrame, last_full_month: str):
     """).fetchdf().set_index("CohortMonth")["MaxValidPeriod"]
     con.close()
 
-    all_periods = list(range(0, int(cohort_summary["PeriodIndex"].max()) + 1))
+    max_valid_period = max(int(horizon.max()), 0)
+    max_period = min(int(cohort_summary["PeriodIndex"].max()), max_valid_period)
+    all_periods = list(range(0, max_period + 1))
     cohorts = sorted(horizon.index)
 
     def pivot_masked(value_col):

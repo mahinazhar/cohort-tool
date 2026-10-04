@@ -105,7 +105,7 @@ gross_margin_pct = st.number_input(
 )
 cumulative_profit = cc.apply_gross_margin(matrices["cumulative_revenue_per_customer"], gross_margin_pct)
 
-cac = st.number_input("Assumed CAC", min_value=0.0, value=0.0, step=10.0,
+cac = st.number_input("Assumed CAC", min_value=0.0, value=500.0, step=10.0,
                        help=f"Customer acquisition cost, in {CCY}.")
 
 payback = cc.payback_periods(cumulative_profit, cac)
