@@ -10,6 +10,7 @@ Built with Claude Code in 6 hours; I specified the analysis, checked the
 outputs and made the methodology calls.
 
 **Try it live:** https://mahinazhar-cohort-tool-app-o7dfwn.streamlit.app
+
 **Run locally:** see [Running locally](#running-locally) below.
 
 ![Retention and CAC payback charts](app_screenshot.png)
