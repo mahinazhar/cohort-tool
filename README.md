@@ -6,7 +6,7 @@ with `CustomerID`, `InvoiceDate`, `Quantity` and `UnitPrice`, enter a CAC
 and a gross margin assumption, and get cohort matrices, retention curves,
 and a payback chart — all downloadable as PNGs/CSV/ZIP.
 
-**Try it live:** _link pending deployment_
+**Try it live:** https://mahinazhar-cohort-tool-app-o7dfwn.streamlit.app
 **Run locally:** see [Running locally](#running-locally) below.
 
 ![Retention and CAC payback charts](app_screenshot.png)
