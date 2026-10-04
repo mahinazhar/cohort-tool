@@ -46,6 +46,40 @@ retention % matrix, and a cumulative-revenue-per-customer matrix — each
 as a heatmap and a table — plus a retention-curve chart and a
 cumulative-gross-profit-vs-CAC chart with per-cohort payback periods.
 
+## Methodology calls and caveats
+
+Calls I made:
+
+- **Cancellations are netted, not dropped.** Dropping return rows leaves
+  the original sale counted in full, which overstates revenue. Each
+  return is matched to an earlier purchase of the same product by the
+  same customer.
+- **A partial final month is excluded.** Otherwise every cohort's most
+  recent period looks like a drop in retention when it is just
+  incomplete data.
+- **Rows with no customer ID are removed.** They can't be assigned to a
+  cohort. The revenue this excludes is shown in the cleaning summary
+  so the size of the gap is visible.
+
+Caveats when reading the output:
+
+- **The earliest cohort is not a true cohort.** The data has a start
+  date, so the first month contains every existing customer who
+  happened to buy then, not just new ones. It will look stronger than
+  later cohorts on retention and payback, and should be read
+  separately.
+- **Retention curves pick up calendar seasonality.** Each cohort's
+  latest point falls in the same calendar month. If that month is a
+  seasonal peak, every curve turns up at the end, which is timing and
+  not improving retention.
+- **Payback uses the average customer.** Revenue per customer is a
+  mean, so a few very large accounts can pull a whole cohort past
+  payback while the typical customer in it is not there yet.
+- **CAC is an assumption, not data.** The dataset has no acquisition
+  spend, so the payback period is driven by the CAC and gross margin
+  entered. Treat it as a sensitivity to those inputs, not as a finding
+  about the business.
+
 ## Running locally
 
 ```
