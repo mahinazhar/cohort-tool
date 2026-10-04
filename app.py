@@ -152,3 +152,8 @@ st.download_button(
     "Download all as ZIP", zip_buffer.getvalue(),
     file_name="cohort_analysis.zip", mime="application/zip",
 )
+
+st.caption(
+    "Sample data: Online Retail dataset, Daqing Chen, UCI Machine Learning "
+    "Repository (London South Bank University)."
+)

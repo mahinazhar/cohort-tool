@@ -4,3 +4,8 @@ __pycache__/
 streamlit.log
 retention_curves.png
 cumulative_revenue_cac.png
+
+# Streamlit secrets / local env files - never commit these
+.streamlit/secrets.toml
+.env
+.env.*
